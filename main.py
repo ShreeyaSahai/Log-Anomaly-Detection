@@ -22,7 +22,7 @@ RAG_CSV_PATH    = os.environ.get("RAG_CSV_PATH", "results/rag_documents.csv")
 EMBEDDINGS_PATH = os.environ.get("EMBEDDINGS_PATH", "results/embeddings.npy")
 CHROMA_DIR      = os.environ.get("CHROMA_DIR", "./chroma_db")
 COLLECTION_NAME = "anomaly_logs"
-NPY_PATH        = os.environ.get("NPY_PATH", "results/embeddings.npy")
+
 # ─────────────────────────────────────────────────────────────────────────────
 # EVENT DESCRIPTIONS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -92,23 +92,25 @@ FALLBACK_MITIGATIONS = {
 # ─────────────────────────────────────────────────────────────────────────────
 # GLOBALS
 # ─────────────────────────────────────────────────────────────────────────────
-documents    = []
-all_metadata = []
-block_lookup = {}
-collection   = None
-groq_client  = None
-# ONNX session for query-time embedding (tiny memory vs full torch)
-onnx_session     = None
-tokenizer        = None
+documents        = []
+all_metadata     = []
+block_lookup     = {}
+collection       = None
+groq_client      = None
+
+# Precomputed embeddings matrix (shape: [N, D]) — used for numpy cosine retrieval
+# No model is loaded at runtime; queries are matched by TF-IDF-style keyword
+# overlap against document text when block_id lookup is unavailable.
+embeddings_matrix: Optional[np.ndarray] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STARTUP
+# STARTUP  — lightweight, no model downloads
 # ─────────────────────────────────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global documents, all_metadata, block_lookup, collection, groq_client
-    global onnx_session, tokenizer
+    global embeddings_matrix
 
     print("[startup] Loading RAG documents...")
     rag_df    = pd.read_csv(RAG_CSV_PATH)
@@ -118,11 +120,15 @@ async def lifespan(app: FastAPI):
     all_metadata = [parse_metadata_from_doc(doc) for doc in documents]
 
     print("[startup] Loading pre-computed embeddings...")
-    embeddings = np.load(EMBEDDINGS_PATH).astype("float32")
-    print(f"[startup] Embeddings shape: {embeddings.shape}")
+    embeddings_matrix = np.load(EMBEDDINGS_PATH).astype("float32")
+    # L2-normalise once so cosine similarity = dot product
+    norms = np.linalg.norm(embeddings_matrix, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1e-9, norms)
+    embeddings_matrix = embeddings_matrix / norms
+    print(f"[startup] Embeddings shape: {embeddings_matrix.shape}")
 
     print("[startup] Building ChromaDB index (in-memory)...")
-    chroma_client = chromadb.EphemeralClient()   # no disk — saves memory
+    chroma_client = chromadb.EphemeralClient()
     try:
         chroma_client.delete_collection(name=COLLECTION_NAME)
     except Exception:
@@ -134,29 +140,19 @@ async def lifespan(app: FastAPI):
         end = min(start + BATCH, len(documents))
         collection.add(
             documents  = documents[start:end],
-            embeddings = embeddings[start:end].tolist(),
+            embeddings = embeddings_matrix[start:end].tolist(),
             ids        = [str(i) for i in range(start, end)],
             metadatas  = all_metadata[start:end],
         )
     print(f"[startup] Indexed {collection.count()} vectors.")
 
-    # Load ONNX model for query embedding — ~80MB vs ~300MB for torch
-    print("[startup] Loading ONNX embedding model...")
-    from optimum.onnxruntime import ORTModelForFeatureExtraction
-    from transformers import AutoTokenizer
-    tokenizer    = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
-    onnx_session = ORTModelForFeatureExtraction.from_pretrained(
-        "sentence-transformers/all-MiniLM-L6-v2", export=True
-    )
-    print("[startup] ONNX model ready.")
-
     block_lookup = {
-        m["block_id"]: (documents[i], m)
+        m["block_id"]: (documents[i], m, i)   # i = row index into embeddings_matrix
         for i, m in enumerate(all_metadata)
     }
 
     groq_client = Groq(api_key=GROQ_API_KEY)
-    print("[startup] Ready.")
+    print("[startup] Ready — no model loaded, using precomputed embeddings only.")
     yield
     print("[shutdown] Done.")
 
@@ -180,21 +176,83 @@ def parse_metadata_from_doc(doc: str) -> dict:
     }
 
 
-def embed_query(text: str) -> list:
-    """Embed a single query string using ONNX — no torch required."""
-    import torch
-    inputs  = tokenizer(text, return_tensors="pt", truncation=True,
-                        max_length=256, padding=True)
-    outputs = onnx_session(**inputs)
-    # Mean pooling
-    token_embeddings = outputs.last_hidden_state
-    attention_mask   = inputs["attention_mask"]
-    mask_expanded    = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-    pooled           = (token_embeddings * mask_expanded).sum(1) / mask_expanded.sum(1).clamp(min=1e-9)
-    vec              = torch.nn.functional.normalize(pooled, p=2, dim=1)
-    return vec.detach().numpy().tolist()
+# ─────────────────────────────────────────────────────────────────────────────
+# RETRIEVAL — no embedding model needed
+# ─────────────────────────────────────────────────────────────────────────────
+def retrieve_similar(query: str, k: int = 3, anomaly_type_filter: Optional[str] = None):
+    """
+    Retrieve the k most similar documents.
+
+    Strategy:
+    1. If the query matches a known block_id, use that document's precomputed
+       embedding vector directly for exact cosine search via ChromaDB.
+    2. Otherwise fall back to keyword-overlap scoring against document text —
+       zero ML inference, zero model download, works on Render free tier.
+
+    The keyword fallback is intentionally simple and fast: it tokenises the
+    query and scores every document by how many unique query tokens appear in
+    it, then applies the anomaly-type filter.  For an HDFS log tool where
+    queries are structured (event codes, block IDs, anomaly type names) this
+    is surprisingly effective.
+    """
+    # ── Path 1: known block_id → use its precomputed embedding ──────────────
+    entry = block_lookup.get(query.strip())
+    if entry:
+        _, _, idx = entry
+        query_vec = embeddings_matrix[idx].tolist()  # already L2-normalised
+        where = {"primary_type": {"$eq": anomaly_type_filter}} if anomaly_type_filter else None
+        res = collection.query(
+            query_embeddings=[query_vec],
+            n_results=min(k + 1, collection.count()),  # +1 to drop self
+            where=where,
+        )
+        results = []
+        for doc, m, dist in zip(
+            res["documents"][0], res["metadatas"][0], res["distances"][0]
+        ):
+            if m.get("block_id") == query.strip():
+                continue  # skip self
+            results.append({
+                "document":     doc,
+                "block_id":     m.get("block_id", "?"),
+                "primary_type": m.get("primary_type", "?"),
+                "latency":      m.get("latency", 0),
+                "distance":     dist,
+            })
+            if len(results) >= k:
+                break
+        return results
+
+    # ── Path 2: free-text query → keyword overlap scoring ───────────────────
+    query_tokens = set(re.findall(r"\b\w+\b", query.lower()))
+
+    candidates = []
+    for i, (doc, meta) in enumerate(zip(documents, all_metadata)):
+        if anomaly_type_filter and meta["primary_type"] != anomaly_type_filter:
+            continue
+        doc_tokens = set(re.findall(r"\b\w+\b", doc.lower()))
+        overlap    = len(query_tokens & doc_tokens)
+        # Normalise by query length so short queries don't dominate
+        score      = overlap / max(len(query_tokens), 1)
+        candidates.append((score, i))
+
+    # Sort descending; distance = 1 - score so interface is consistent
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    results = []
+    for score, i in candidates[:k]:
+        results.append({
+            "document":     documents[i],
+            "block_id":     all_metadata[i].get("block_id", "?"),
+            "primary_type": all_metadata[i].get("primary_type", "?"),
+            "latency":      all_metadata[i].get("latency", 0),
+            "distance":     round(1.0 - score, 4),
+        })
+    return results
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# REST OF HELPERS (unchanged)
+# ─────────────────────────────────────────────────────────────────────────────
 def compress_historical_case(doc, block_id, latency, distance) -> str:
     seq_m   = re.search(r"Event Sequence\s*:\s*(.+)", doc)
     atype_m = re.search(r"Anomaly Type\(s\)\s*:\s*(.+)", doc)
@@ -224,18 +282,6 @@ def build_event_context(doc) -> str:
         return "No event sequence."
     ids = list(dict.fromkeys(re.findall(r"E\d+", seq_m.group(1))))
     return "\n".join(f"{e}: {EVENT_DESCRIPTIONS.get(e,'Unknown')}" for e in ids)
-
-
-def retrieve_similar(query, k=3, anomaly_type_filter=None):
-    qemb  = embed_query(query)
-    where = {"primary_type": {"$eq": anomaly_type_filter}} if anomaly_type_filter else None
-    res   = collection.query(query_embeddings=qemb, n_results=k, where=where)
-    return [
-        {"document": doc, "block_id": m.get("block_id","?"),
-         "primary_type": m.get("primary_type","?"),
-         "latency": m.get("latency", 0), "distance": d}
-        for doc, m, d in zip(res["documents"][0], res["metadatas"][0], res["distances"][0])
-    ]
 
 
 def repair_json(s: str) -> dict:
@@ -423,9 +469,9 @@ def analyze(request: AnalyzeRequest):
     if request.block_id:
         if request.block_id not in block_lookup:
             raise HTTPException(404, f"block_id '{request.block_id}' not found.")
-        q_doc, q_meta = block_lookup[request.block_id]
-        query_str     = build_query_from_doc(q_doc, q_meta)
-        atype_filter  = request.anomaly_type_filter or q_meta["primary_type"]
+        q_doc, q_meta, _ = block_lookup[request.block_id]
+        query_str         = request.block_id          # triggers Path 1 in retrieve_similar
+        atype_filter      = request.anomaly_type_filter or q_meta["primary_type"]
     else:
         q_doc        = request.query
         q_meta       = {"block_id": "external_query",
