@@ -5,12 +5,16 @@ services:
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+
     envVars:
       - key: GROQ_API_KEY
         sync: false
+
       - key: RAG_CSV_PATH
-        value: rag_documents.csv
+        value: results/rag_documents.csv
+
       - key: EMBEDDINGS_PATH
-        value: embeddings.npy
+        value: results/embeddings.npy
+
       - key: CHROMA_DIR
         value: ./chroma_db
