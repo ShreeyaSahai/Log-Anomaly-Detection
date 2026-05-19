@@ -18,12 +18,11 @@ from groq import Groq
 # CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 GROQ_API_KEY    = os.environ.get("GROQ_API_KEY", "")
-RAG_CSV_PATH    = os.environ.get("RAG_CSV_PATH",    "rag_documents.csv")
-EMBEDDINGS_PATH = os.environ.get("EMBEDDINGS_PATH", "embeddings.npy")
-CHROMA_DIR      = os.environ.get("CHROMA_DIR",      "./chroma_db")
+RAG_CSV_PATH    = os.environ.get("RAG_CSV_PATH", "results/rag_documents.csv")
+EMBEDDINGS_PATH = os.environ.get("EMBEDDINGS_PATH", "results/embeddings.npy")
+CHROMA_DIR      = os.environ.get("CHROMA_DIR", "./chroma_db")
 COLLECTION_NAME = "anomaly_logs"
-NPY_PATH = os.environ.get("NPY_PATH", "embeddings.npy")
-
+NPY_PATH        = os.environ.get("NPY_PATH", "results/embeddings.npy")
 # ─────────────────────────────────────────────────────────────────────────────
 # EVENT DESCRIPTIONS
 # ─────────────────────────────────────────────────────────────────────────────
