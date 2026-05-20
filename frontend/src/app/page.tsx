@@ -65,7 +65,7 @@ export default function Dashboard() {
       const isBlockId = query.trim().startsWith("blk_");
       const requestBody = isBlockId ? { block_id: query.trim() } : { query: query.trim() };
 
-      const response = await fetch(" https://hdfs-anomaly-api.onrender.com//analyze", {
+      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/analyze`, {
         method: "POST",
         headers: { "Accept": "application/json", "Content-Type": "application/json" },
         body: JSON.stringify(requestBody),
