@@ -8,16 +8,9 @@ import AnomalyBadge from "@/components/AnomalyBadge";
 import ConfidenceBar from "@/components/ConfidenceBar";
 import EventExplanationPanel from "@/components/EventExplanationPanel";
 import MitigationPanel from "@/components/MitigationPanel";
-//import { Activity, Loader2 } from "lucide-react";
+import HistoricalComparisonCard from "@/components/HistoricalComparisonCard";
 import { motion, AnimatePresence } from "framer-motion";
-import {
-  Activity,
-  Loader2,
-  Search,
-  Database,
-  BrainCircuit,
-  CheckCircle2
-} from "lucide-react";
+import { Activity, Search, Database, BrainCircuit, CheckCircle2 } from "lucide-react";
 
 interface AnalysisResult {
   summary: string;
@@ -36,34 +29,50 @@ interface AnalysisResult {
   };
 }
 
-// Fallback event dictionary for legacy API responses
-const EVENT_DICT: Record<string, string> = {
-  E1: "Receiving block", E2: "Verification succeeded", E3: "Served block",
-  E4: "Exception while serving", E5: "Receiving block (src→dest)",
-  E6: "Unexpected error", E7: "writeBlock exception",
-  E8: "PacketResponder exception", E9: "Received block (confirmed)",
-  E10: "PacketResponder terminating", E11: "PacketResponder terminating",
-  E20: "Error deleting block", E21: "Deleting block file",
-  E22: "NameSystem allocateBlock", E23: "Block added to invalidSet",
-  E26: "addStoredBlock: blockMap updated", E27: "Redundant addStoredBlock",
-};
+// Extract anomaly_type_filter from free-text query
+// Looks for any of the 4 known types mentioned in the query string
+function extractAnomalyFilter(text: string): string | undefined {
+  const lower = text.toLowerCase();
+  if (lower.includes("duplicate_pattern") || lower.includes("duplicate pattern")) return "duplicate_pattern";
+  if (lower.includes("missing_events")    || lower.includes("missing events"))    return "missing_events";
+  if (lower.includes("high_latency")      || lower.includes("high latency"))      return "high_latency";
+  if (lower.includes("repetition"))                                                return "repetition";
+  return undefined;
+}
 
 export default function Dashboard() {
-  const [query, setQuery] = useState("");
+  const [query, setQuery]       = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<AnalysisResult | null>(null);
+  const [error, setError]       = useState<string | null>(null);
+  const [result, setResult]     = useState<AnalysisResult | null>(null);
 
   const handleAnalyze = async () => {
     if (!query.trim()) return;
-
     setIsLoading(true);
     setError(null);
     setResult(null);
 
     try {
-      const isBlockId = query.trim().startsWith("blk_");
-      const requestBody = isBlockId ? { block_id: query.trim() } : { query: query.trim() };
+      const trimmed = query.trim();
+
+      // Detect whether user typed a bare block_id or a free-text / log query
+      const isBlockId = trimmed.startsWith("blk_");
+
+      let requestBody: Record<string, unknown>;
+      if (isBlockId) {
+        // PATH 1 — block_id lookup: uses precomputed embedding, gives best LLM output
+        requestBody = { block_id: trimmed, k: 3 };
+      } else {
+        // PATH 2 — free-text query: keyword overlap retrieval
+        // FIX: also send anomaly_type_filter when we can parse it from the query
+        // so the backend restricts ChromaDB search to matching anomaly type
+        const filter = extractAnomalyFilter(trimmed);
+        requestBody = {
+          query: trimmed,
+          k: 3,
+          ...(filter ? { anomaly_type_filter: filter } : {}),
+        };
+      }
 
       const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/analyze`, {
         method: "POST",
@@ -72,150 +81,35 @@ export default function Dashboard() {
       });
 
       if (!response.ok) {
-        throw new Error(`Error: ${response.status} ${response.statusText}`);
+        const errText = await response.text().catch(() => response.statusText);
+        throw new Error(`${response.status}: ${errText}`);
       }
 
       const data = await response.json();
 
-      // ── Structured API (new format) ──
-      if (data.summary && data.root_cause) {
-        const parsed: AnalysisResult = {
-          summary: data.summary || "Analysis complete.",
-          root_cause: data.root_cause || "Unknown",
-          event_explanations: data.event_explanations || {},
-          anomaly_type: data.anomaly_type || "Unknown",
-          confidence: data.confidence ?? 0.5,
-          confidence_label: data.confidence_label,
-          comparison_to_historical: data.comparison_to_historical,
-          retrieved_block_ids: data.retrieved_block_ids,
-          query_block_id: data.query_block_id,
-          mitigation_steps: data.mitigation_steps || { high: [], medium: [], low: [] },
-        };
-        setResult(parsed);
-        return;
+      if (data.error) {
+        throw new Error(data.error);
       }
 
-      // ── Legacy API (llm_output markdown string) ──
-      if (data.llm_output) {
-        const text: string = data.llm_output;
-        const parsed: AnalysisResult = {
-          summary: "",
-          root_cause: "Unknown Root Cause",
-          anomaly_type: "System",
-          confidence: 0.5,
-          mitigation_steps: { high: [], medium: [], low: [] },
-        };
+      // Current structured API format
+      const parsed: AnalysisResult = {
+        summary:                data.summary                || "Analysis complete.",
+        root_cause:             data.root_cause             || "Unknown root cause.",
+        event_explanations:     data.event_explanations     || {},
+        anomaly_type:           data.anomaly_type           || "unknown",
+        confidence:             data.confidence             ?? 0.5,
+        confidence_label:       data.confidence_label,
+        comparison_to_historical: data.comparison_to_historical,
+        retrieved_block_ids:    data.retrieved_block_ids    || [],
+        query_block_id:         data.query_block_id,
+        mitigation_steps:       data.mitigation_steps       || { high: [], medium: [], low: [] },
+      };
+      setResult(parsed);
 
-        // Extract event codes mentioned in the text
-        const eventCodes = new Set(text.match(/\bE\d+\b/g) || []);
-        const eventExplanations: Record<string, string> = {};
-        eventCodes.forEach((code) => {
-          if (EVENT_DICT[code]) eventExplanations[code] = EVENT_DICT[code];
-        });
-        if (Object.keys(eventExplanations).length > 0) parsed.event_explanations = eventExplanations;
-
-        // Also extract from similar_cases
-        if (data.similar_cases) {
-          for (const c of data.similar_cases) {
-            const docCodes = (c.document || "").match(/\bE\d+\b/g) || [];
-            docCodes.forEach((code: string) => {
-              if (EVENT_DICT[code] && !eventExplanations[code]) {
-                eventExplanations[code] = EVENT_DICT[code];
-              }
-            });
-          }
-          if (Object.keys(eventExplanations).length > 0) parsed.event_explanations = eventExplanations;
-        }
-
-        // Section boundaries
-        const rcIdx = text.search(/root cause/i);
-        const catIdx = text.search(/anomaly categor|anomaly type/i);
-        const confIdx = text.search(/confidence/i);
-        const mitIdx = text.search(/mitigation/i);
-
-        const nextAfter = (cur: number, ...others: number[]) => {
-          let end = text.length;
-          for (const o of others) if (o > cur && o < end) end = o;
-          return end;
-        };
-
-        // Root Cause
-        if (rcIdx !== -1) {
-          const end = nextAfter(rcIdx, catIdx, confIdx, mitIdx);
-          let rc = text.substring(rcIdx, end).replace(/^[^\n:]*[:\n]\s*/, "").trim();
-          const bold = rc.match(/\*\*([^*]{5,80})\*\*/);
-          if (bold && !bold[1].toLowerCase().includes("root cause")) {
-            parsed.root_cause = bold[1].trim();
-            parsed.summary = rc.replace(/\*\*/g, "").trim();
-          } else {
-            const dot = rc.indexOf(". ");
-            if (dot > 0 && dot < 250) {
-              parsed.root_cause = rc.substring(0, dot + 1).replace(/\*\*/g, "").trim();
-              parsed.summary = rc.substring(dot + 1).replace(/\*\*/g, "").trim();
-            } else {
-              parsed.root_cause = rc.substring(0, 150).replace(/\*\*/g, "").trim();
-              parsed.summary = rc.replace(/\*\*/g, "").trim();
-            }
-          }
-        }
-
-        // Anomaly Category
-        if (catIdx !== -1) {
-          const end = nextAfter(catIdx, rcIdx, confIdx, mitIdx);
-          const cat = text.substring(catIdx, end).replace(/^[^\n:]*[:\n]\s*/, "").replace(/\*/g, "").trim();
-          parsed.anomaly_type = cat.split("\n")[0].trim() || "System";
-        }
-
-        // Confidence
-        if (confIdx !== -1) {
-          const end = nextAfter(confIdx, rcIdx, catIdx, mitIdx);
-          const conf = text.substring(confIdx, end).toLowerCase();
-          if (conf.includes("high")) { parsed.confidence = 0.95; parsed.confidence_label = "High"; }
-          else if (conf.includes("medium")) { parsed.confidence = 0.65; parsed.confidence_label = "Medium"; }
-          else if (conf.includes("low")) { parsed.confidence = 0.35; parsed.confidence_label = "Low"; }
-        }
-
-        // Mitigation Steps
-        if (mitIdx !== -1) {
-          let raw = text.substring(mitIdx).replace(/^[^\n:]*[:\n]\s*/, "").trim();
-          const addIdx = raw.search(/additional recommend/i);
-          if (addIdx > 0) raw = raw.substring(0, addIdx);
-
-          const lines = raw.split(/\n/).map((l) => l.replace(/\*\*/g, "").trim()).filter((l) => l.length > 0);
-          let cat: "high" | "medium" | "low" = "high";
-          const stepCount = { high: 0, medium: 0, low: 0 };
-
-          for (const line of lines) {
-            const lower = line.toLowerCase();
-            if (lower.includes("high priority")) { cat = "high"; continue; }
-            if (lower.includes("medium priority")) { cat = "medium"; continue; }
-            if (lower.includes("low priority")) { cat = "low"; continue; }
-
-            const clean = line.replace(/^[\*\-\d\.]+\s*/, "").trim();
-            if (clean && clean.length > 5 && !lower.includes("priority") && !lower.includes("ordered by")) {
-              parsed.mitigation_steps[cat]!.push(clean);
-              stepCount[cat]++;
-            }
-          }
-
-          // Auto-distribute if all steps fell into one bucket
-          const h = parsed.mitigation_steps.high!;
-          if (h.length >= 3 && !stepCount.medium && !stepCount.low) {
-            parsed.mitigation_steps.high = h.slice(0, 2);
-            parsed.mitigation_steps.medium = h.slice(2, 4);
-            parsed.mitigation_steps.low = h.slice(4);
-          }
-        }
-
-        setResult(parsed);
-        return;
-      }
-
-      // Fallback: use data as-is
-      setResult(data);
-    } catch (err: any) {
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : "Failed to analyze. Check backend is running.";
       console.error("API error:", err);
-      setError(err.message || "Failed to analyze query. Make sure backend is running.");
+      setError(msg);
     } finally {
       setIsLoading(false);
     }
@@ -235,13 +129,22 @@ export default function Dashboard() {
             </h1>
           </div>
           <div className="ml-auto flex items-center gap-2">
-            <span className="text-[11px] text-slate-500 bg-slate-800 px-2.5 py-1 rounded-md border border-slate-700/50">LLM-Powered</span>
+            <span className="text-[11px] text-slate-500 bg-slate-800 px-2.5 py-1 rounded-md border border-slate-700/50">
+              LLM-Powered
+            </span>
           </div>
         </div>
       </header>
 
-      {/* Main Content */}
+      {/* Main */}
       <main className="max-w-7xl mx-auto px-6 py-8">
+
+        {/* Hint text */}
+        <p className="text-xs text-slate-500 mb-3 ml-1">
+          Tip: Paste a <span className="font-mono text-slate-400">blk_…</span> ID for exact lookup,
+          or paste a full log query string for free-text analysis.
+        </p>
+
         {/* Query Input */}
         <div className="mb-10">
           <QueryInput query={query} setQuery={setQuery} onAnalyze={handleAnalyze} isLoading={isLoading} />
@@ -256,79 +159,96 @@ export default function Dashboard() {
         <AnimatePresence>
           {isLoading && (
             <motion.section
-              initial={{ opacity: 0, height: 0 }}
-              animate={{ opacity: 1, height: "auto" }}
-              exit={{ opacity: 0, height: 0 }}
+              initial={{ opacity: 0, y: 12 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -8 }}
+              transition={{ duration: 0.3 }}
               className="overflow-hidden"
             >
-              <div className="py-16 flex flex-col items-center">
+              <div className="py-16 flex flex-col items-center gap-10">
+                {/* Title */}
+                <div className="flex flex-col items-center gap-2">
+                  <motion.p
+                    className="font-mono text-sm uppercase tracking-widest text-indigo-400"
+                    animate={{ opacity: [0.5, 1, 0.5] }}
+                    transition={{ repeat: Infinity, duration: 2 }}
+                  >
+                    AI Pipeline Running
+                  </motion.p>
+                  <p className="text-xs text-slate-600">Retrieving similar cases · Generating root cause</p>
+                </div>
 
-                <p className="text-slate-400 mb-8 font-mono text-sm uppercase tracking-widest animate-pulse">
-                  AI Pipeline in Progress
-                </p>
+                {/* Pipeline nodes */}
+                <div className="flex items-center justify-center w-full max-w-2xl">
+                  {[
+                    { icon: Search,       label: "Query",  color: "blue",   delay: 0    },
+                    { icon: Database,     label: "RAG",    color: "indigo", delay: 0.4  },
+                    { icon: BrainCircuit, label: "LLM",    color: "purple", delay: 0.8  },
+                    { icon: CheckCircle2, label: "Output", color: "green",  delay: 1.2  },
+                  ].map((node, i, arr) => {
+                    const colorMap: Record<string, { ring: string; bg: string; icon: string; dot: string; connector: string }> = {
+                      blue:   { ring: "border-blue-500",   bg: "bg-blue-500/15",   icon: "text-blue-400",   dot: "bg-blue-400",   connector: "from-blue-500/40 to-indigo-500/40" },
+                      indigo: { ring: "border-indigo-500", bg: "bg-indigo-500/15", icon: "text-indigo-400", dot: "bg-indigo-400", connector: "from-indigo-500/40 to-purple-500/40" },
+                      purple: { ring: "border-purple-500", bg: "bg-purple-500/15", icon: "text-purple-400", dot: "bg-purple-400", connector: "from-purple-500/40 to-green-500/40" },
+                      green:  { ring: "border-slate-700",  bg: "bg-slate-800",     icon: "text-green-400",  dot: "bg-green-400",  connector: "" },
+                    };
+                    const c = colorMap[node.color];
+                    const Icon = node.icon;
+                    return (
+                      <div key={node.label} className="flex items-center flex-1 last:flex-none">
+                        {/* Node */}
+                        <motion.div
+                          className="flex flex-col items-center gap-2 shrink-0"
+                          initial={{ opacity: 0, scale: 0.7 }}
+                          animate={{ opacity: 1, scale: 1 }}
+                          transition={{ delay: node.delay, duration: 0.4, type: "spring" }}
+                        >
+                          <div className={`relative w-14 h-14 rounded-full ${c.bg} border ${c.ring} flex items-center justify-center`}>
+                            <Icon className={`w-6 h-6 ${c.icon}`} />
+                            {/* Pulse ring */}
+                            <motion.div
+                              className={`absolute inset-0 rounded-full border ${c.ring}`}
+                              animate={{ scale: [1, 1.45, 1], opacity: [0.6, 0, 0.6] }}
+                              transition={{ repeat: Infinity, duration: 1.8, delay: node.delay }}
+                            />
+                          </div>
+                          <span className={`text-[11px] font-medium ${c.icon}`}>{node.label}</span>
+                        </motion.div>
 
-                <div className="flex items-center justify-center w-full max-w-4xl gap-4">
+                        {/* Connector (not after last node) */}
+                        {i < arr.length - 1 && (
+                          <div className={`flex-1 h-px mx-3 bg-gradient-to-r ${c.connector} relative overflow-hidden`}>
+                            {/* Travelling dot */}
+                            <motion.div
+                              className={`absolute top-1/2 -translate-y-1/2 w-2 h-2 rounded-full ${c.dot} shadow-lg`}
+                              animate={{ left: ["-8px", "calc(100% + 8px)"] }}
+                              transition={{ repeat: Infinity, duration: 1.4, delay: node.delay + 0.2, ease: "linear" }}
+                            />
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
 
-                  {/* Input */}
-                  <div className="flex flex-col items-center gap-2">
-                    <div className="w-14 h-14 rounded-full bg-blue-500/20 border border-blue-500 flex items-center justify-center animate-pulse">
-                      <Search className="text-blue-400" />
-                    </div>
-                    <span className="text-xs text-blue-300">Input</span>
-                  </div>
-
-                  {/* LINE */}
-                  <div className="h-0.5 flex-1 bg-blue-500/30 relative">
+                {/* Step labels */}
+                <div className="flex gap-3">
+                  {["Parsing query", "Embedding lookup", "Retrieving top-k", "Generating analysis"].map((step, i) => (
                     <motion.div
-                      className="absolute w-1/3 h-full bg-blue-400"
-                      animate={{ left: ["-30%", "100%"] }}
-                      transition={{ repeat: Infinity, duration: 1.5 }}
-                    />
-                  </div>
-
-                  {/* RAG */}
-                  <div className="flex flex-col items-center gap-2">
-                    <div className="w-14 h-14 rounded-full bg-indigo-500/20 border border-indigo-500 flex items-center justify-center relative">
-                      <Database className="text-indigo-400" />
-                      <div className="absolute w-14 h-14 border-2 border-indigo-400 rounded-full animate-ping" />
-                    </div>
-                    <span className="text-xs text-indigo-300">RAG</span>
-                  </div>
-
-                  {/* LINE */}
-                  <div className="h-0.5 flex-1 bg-indigo-500/30 relative">
-                    <motion.div
-                      className="absolute w-1/3 h-full bg-indigo-400"
-                      animate={{ left: ["-30%", "100%"] }}
-                      transition={{ repeat: Infinity, duration: 1.5, delay: 0.5 }}
-                    />
-                  </div>
-
-                  {/* LLM */}
-                  <div className="flex flex-col items-center gap-2">
-                    <div className="w-14 h-14 rounded-full bg-purple-500/20 border border-purple-500 flex items-center justify-center">
-                      <BrainCircuit className="text-purple-400" />
-                    </div>
-                    <span className="text-xs text-purple-300">LLM</span>
-                  </div>
-
-                  {/* LINE */}
-                  <div className="h-0.5 flex-1 bg-purple-500/30 relative">
-                    <motion.div
-                      className="absolute w-1/3 h-full bg-purple-400"
-                      animate={{ left: ["-30%", "100%"] }}
-                      transition={{ repeat: Infinity, duration: 1.5, delay: 1 }}
-                    />
-                  </div>
-
-                  {/* OUTPUT */}
-                  <div className="flex flex-col items-center gap-2">
-                    <div className="w-14 h-14 rounded-full bg-slate-800 border border-slate-700 flex items-center justify-center">
-                      <CheckCircle2 className="text-green-400" />
-                    </div>
-                    <span className="text-xs text-slate-400">Output</span>
-                  </div>
-
+                      key={step}
+                      className="flex items-center gap-2 px-3 py-1.5 bg-slate-800/60 rounded-lg border border-slate-700/50"
+                      initial={{ opacity: 0, y: 6 }}
+                      animate={{ opacity: [0, 1, 0.4] }}
+                      transition={{ delay: i * 0.6, duration: 1.2, repeat: Infinity, repeatDelay: 2.4 - i * 0.1 }}
+                    >
+                      <motion.div
+                        className="w-1.5 h-1.5 rounded-full bg-indigo-400"
+                        animate={{ scale: [1, 1.6, 1] }}
+                        transition={{ delay: i * 0.6, duration: 0.6, repeat: Infinity, repeatDelay: 2 }}
+                      />
+                      <span className="text-[11px] text-slate-400 font-mono">{step}</span>
+                    </motion.div>
+                  ))}
                 </div>
               </div>
             </motion.section>
@@ -338,10 +258,11 @@ export default function Dashboard() {
         {/* Results */}
         {result && !isLoading && (
           <div className="space-y-6">
+
             {/* AI Insight */}
             <InsightCard summary={result.summary} />
 
-            {/* Root Cause + Supporting Info */}
+            {/* Root Cause + Anomaly + Confidence */}
             <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
               <div className="lg:col-span-3">
                 <RootCauseCard rootCause={result.root_cause} />
@@ -352,6 +273,14 @@ export default function Dashboard() {
               </div>
             </div>
 
+            {/* Historical Comparison — FIX: was never rendered */}
+            {result.comparison_to_historical && (
+              <HistoricalComparisonCard
+                comparison={result.comparison_to_historical}
+                similarBlocks={result.retrieved_block_ids}
+              />
+            )}
+
             {/* Event Explanations */}
             {result.event_explanations && Object.keys(result.event_explanations).length > 0 && (
               <EventExplanationPanel events={result.event_explanations} />
@@ -359,6 +288,7 @@ export default function Dashboard() {
 
             {/* Mitigation Steps */}
             <MitigationPanel steps={result.mitigation_steps} />
+
           </div>
         )}
 
