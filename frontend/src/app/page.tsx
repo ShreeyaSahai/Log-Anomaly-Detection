@@ -46,14 +46,16 @@ export default function Dashboard() {
   const [error, setError]       = useState<string | null>(null);
   const [result, setResult]     = useState<AnalysisResult | null>(null);
 
-  const handleAnalyze = async () => {
-    if (!query.trim()) return;
+  const handleAnalyze = async (input?: string) => {
+    const finalQuery = input || query;
+
+    if (!finalQuery.trim()) return;
     setIsLoading(true);
     setError(null);
     setResult(null);
 
     try {
-      const trimmed = query.trim();
+      const trimmed = finalQuery.trim();
 
       // Detect whether user typed a bare block_id or a free-text / log query
       const isBlockId = trimmed.startsWith("blk_");
